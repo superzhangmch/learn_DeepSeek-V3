@@ -424,13 +424,13 @@ class MLA(nn.Module):
         if self.q_lora_rank == 0:
             self.wq = ColumnParallelLinear(self.dim, self.n_heads * self.qk_head_dim)
         else:
-            self.wq_a = Linear(self.dim, self.q_lora_rank)
+            self.wq_a = Linear(self.dim, self.q_lora_rank)                                      # q 降维
             self.q_norm = RMSNorm(self.q_lora_rank)
-            self.wq_b = ColumnParallelLinear(self.q_lora_rank, self.n_heads * self.qk_head_dim)
-        self.wkv_a = Linear(self.dim, self.kv_lora_rank + self.qk_rope_head_dim)
+            self.wq_b = ColumnParallelLinear(self.q_lora_rank, self.n_heads * self.qk_head_dim) # q 升维
+        self.wkv_a = Linear(self.dim, self.kv_lora_rank + self.qk_rope_head_dim)                                       # kv 降维
         self.kv_norm = RMSNorm(self.kv_lora_rank)
-        self.wkv_b = ColumnParallelLinear(self.kv_lora_rank, self.n_heads * (self.qk_nope_head_dim + self.v_head_dim))
-        self.wo = RowParallelLinear(self.n_heads * self.v_head_dim, self.dim)
+        self.wkv_b = ColumnParallelLinear(self.kv_lora_rank, self.n_heads * (self.qk_nope_head_dim + self.v_head_dim)) # kv 升维
+        self.wo = RowParallelLinear(self.n_heads * self.v_head_dim, self.dim) # 最终的 output 维度的还原
         self.softmax_scale = self.qk_head_dim ** -0.5
         if args.max_seq_len > args.original_seq_len:
             mscale = 0.1 * args.mscale * math.log(args.rope_factor) + 1.0
@@ -461,38 +461,50 @@ class MLA(nn.Module):
         if self.q_lora_rank == 0:
             q = self.wq(x)
         else:
-            q = self.wq_b(self.q_norm(self.wq_a(x)))
+            q = self.wq_b(self.q_norm(self.wq_a(x)))                                               # inference 的时候，先把 q 还原
         q = q.view(bsz, seqlen, self.n_local_heads, self.qk_head_dim)
-        q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        q_pe = apply_rotary_emb(q_pe, freqs_cis)
-        kv = self.wkv_a(x)
-        kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis)
-        if attn_impl == "naive":
+        q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1) # 把 q 拆成 rope 与非 rope 两部分
+        q_pe = apply_rotary_emb(q_pe, freqs_cis)              # 对 q rope 部分施加 rope
+        kv = self.wkv_a(x)                                                                         # 把 kv 压缩，得到 kv_latent
+        kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)  # 把 kv 拆成 rope 与 非rope 两部分
+        k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis) # 对 k rope 部分施加 rope
+        if attn_impl == "naive": # 和非 naive 结果等价. training/prefill 的时候用它
             q = torch.cat([q_nope, q_pe], dim=-1)
-            kv = self.wkv_b(self.kv_norm(kv))
+
+            # 针对的非 rope 部分：下面三行，从压缩后的 latent 还原出 k 与 v 
+            kv = self.wkv_b(self.kv_norm(kv)) # 从 latent 还原出 kv
             kv = kv.view(bsz, seqlen, self.n_local_heads, self.qk_nope_head_dim + self.v_head_dim)
             k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-            k = torch.cat([k_nope, k_pe.expand(-1, -1, self.n_local_heads, -1)], dim=-1)
+
+            k = torch.cat([k_nope, k_pe.expand(-1, -1, self.n_local_heads, -1)], dim=-1) # concat(repe 与 非rope), 得到参与 attn 的 k
             self.k_cache[:bsz, start_pos:end_pos] = k
             self.v_cache[:bsz, start_pos:end_pos] = v
-            scores = torch.einsum("bshd,bthd->bsht", q, self.k_cache[:bsz, :end_pos]) * self.softmax_scale
-        else:
+
+            # 作 attn 的 QK'/scale 操作（乃 softmax 的 input）
+            scores = torch.einsum("bshd,bthd->bsht", q, self.k_cache[:bsz, :end_pos]) * self.softmax_scale          # QK'，Q 与 K 都是还原后的
+            #  上面 b=batch, s,t=seq, h=heads, d=state_dim; scores := out[b,s,h,t]=∑_d ​(in1[b,s,h,d] × in2[b,t,h,d])
+        else:  # 逐token decoding 的时候用它
             wkv_b = self.wkv_b.weight if self.wkv_b.scale is None else weight_dequant(self.wkv_b.weight, self.wkv_b.scale, block_size) 
             wkv_b = wkv_b.view(self.n_local_heads, -1, self.kv_lora_rank)
+
+            # q_nope 已经是还原后的 q，而 wkv_b 是用来还原 k 的。
+            # 但是 QK' = Q (latent_K*wkv_b)' = Q (wkv_b)' latent_K' = [Q (wkv_b)'] latent_K', 于是可以把 q 和 wkv_b 结合形成新的 q_new, 而 k_new := latent_k
             q_nope = torch.einsum("bshd,hdc->bshc", q_nope, wkv_b[:, :self.qk_nope_head_dim])
+            
             self.kv_cache[:bsz, start_pos:end_pos] = self.kv_norm(kv)
             self.pe_cache[:bsz, start_pos:end_pos] = k_pe.squeeze(2)
-            scores = (torch.einsum("bshc,btc->bsht", q_nope, self.kv_cache[:bsz, :end_pos]) +
-                      torch.einsum("bshr,btr->bsht", q_pe, self.pe_cache[:bsz, :end_pos])) * self.softmax_scale
+            scores = (
+                        torch.einsum("bshc,btc->bsht", q_nope, self.kv_cache[:bsz, :end_pos]) +                    # QK', 示意地说：Q=latent_q * W_q_up * W'_k_up, K=latent_k
+                        torch.einsum("bshr,btr->bsht", q_pe, self.pe_cache[:bsz, :end_pos])
+                     ) * self.softmax_scale
         if mask is not None:
             scores += mask.unsqueeze(1)
-        scores = scores.softmax(dim=-1, dtype=torch.float32).type_as(x)
+        scores = scores.softmax(dim=-1, dtype=torch.float32).type_as(x) # softmax
         if attn_impl == "naive":
-            x = torch.einsum("bsht,bthd->bshd", scores, self.v_cache[:bsz, :end_pos])
+            x = torch.einsum("bsht,bthd->bshd", scores, self.v_cache[:bsz, :end_pos])     # score * 解压还原后的v
         else:
-            x = torch.einsum("bsht,btc->bshc", scores, self.kv_cache[:bsz, :end_pos])
-            x = torch.einsum("bshc,hdc->bshd", x, wkv_b[:, -self.v_head_dim:])
+            x = torch.einsum("bsht,btc->bshc", scores, self.kv_cache[:bsz, :end_pos])     # 先乘 latent_v
+            x = torch.einsum("bshc,hdc->bshd", x, wkv_b[:, -self.v_head_dim:])            # 再乘 W_v_up（从而还原了 latent_v)
         x = self.wo(x.flatten(2))
         return x
 
