@@ -387,9 +387,9 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
         torch.Tensor: Tensor with rotary embeddings applied.
     """
     dtype = x.dtype
-    x = torch.view_as_complex(x.float().view(*x.shape[:-1], -1, 2))
-    freqs_cis = freqs_cis.view(1, x.size(1), 1, x.size(-1))
-    y = torch.view_as_real(x * freqs_cis).flatten(3)
+    x = torch.view_as_complex(x.float().view(*x.shape[:-1], -1, 2)) # 最后一维，两两元素当做复数
+    freqs_cis = freqs_cis.view(1, x.size(1), 1, x.size(-1))         # 把 freqs_cis shape 变成和 x 一样
+    y = torch.view_as_real(x * freqs_cis).flatten(3)                # x * freqs_cis：复数相乘，相当于在复平面上做旋转; view_as_real(..): 单个复数按 real, img 展开乘两个实数
     return y.to(dtype)
 
 
