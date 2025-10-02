@@ -483,7 +483,7 @@ class MLA(nn.Module):
             # 作 attn 的 QK'/scale 操作（乃 softmax 的 input）
             scores = torch.einsum("bshd,bthd->bsht", q, self.k_cache[:bsz, :end_pos]) * self.softmax_scale          # QK'，Q 与 K 都是还原后的
             #  上面 b=batch, s,t=seq, h=heads, d=state_dim; scores := out[b,s,h,t]=∑_d ​(in1[b,s,h,d] × in2[b,t,h,d])
-        else:  # 逐token decoding 的时候用它
+        else:  # 逐token decoding 的时候用它. 这就是 absorb 模式。本脚本中默认走该分支
             wkv_b = self.wkv_b.weight if self.wkv_b.scale is None else weight_dequant(self.wkv_b.weight, self.wkv_b.scale, block_size) 
             wkv_b = wkv_b.view(self.n_local_heads, -1, self.kv_lora_rank)
 
