@@ -390,6 +390,7 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     x = torch.view_as_complex(x.float().view(*x.shape[:-1], -1, 2)) # 最后一维，两两元素当做复数
     freqs_cis = freqs_cis.view(1, x.size(1), 1, x.size(-1))         # 把 freqs_cis shape 变成和 x 一样
     y = torch.view_as_real(x * freqs_cis).flatten(3)                # x * freqs_cis：复数相乘，相当于在复平面上做旋转; view_as_real(..): 单个复数按 real, img 展开乘两个实数
+    # 也可以弄成一个矩阵乘法来搞 rope，但是应该是上面这样做法更高效吧
     return y.to(dtype)
 
 
@@ -477,25 +478,28 @@ class MLA(nn.Module):
             k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
 
             k = torch.cat([k_nope, k_pe.expand(-1, -1, self.n_local_heads, -1)], dim=-1) # concat(repe 与 非rope), 得到参与 attn 的 k
+            # 注意上面 k_pe.expand(..)：mla rope 分支的 k 只有一个 head，需要expand（复制）成多个 heads，然后才能和多 heads 的 k_nope 拼接
             self.k_cache[:bsz, start_pos:end_pos] = k
             self.v_cache[:bsz, start_pos:end_pos] = v
 
             # 作 attn 的 QK'/scale 操作（乃 softmax 的 input）
-            scores = torch.einsum("bshd,bthd->bsht", q, self.k_cache[:bsz, :end_pos]) * self.softmax_scale          # QK'，Q 与 K 都是还原后的
+            scores = torch.einsum("bshd,bthd->bsht", q, self.k_cache[:bsz, :end_pos]) * self.softmax_scale          # QK'，Q=q 与 K=self.k_cache[] 都是还原后的
             #  上面 b=batch, s,t=seq, h=heads, d=state_dim; scores := out[b,s,h,t]=∑_d ​(in1[b,s,h,d] × in2[b,t,h,d])
         else:  # 逐token decoding 的时候用它. 这就是 absorb 模式。本脚本中默认走该分支
             wkv_b = self.wkv_b.weight if self.wkv_b.scale is None else weight_dequant(self.wkv_b.weight, self.wkv_b.scale, block_size) 
             wkv_b = wkv_b.view(self.n_local_heads, -1, self.kv_lora_rank)
 
-            # q_nope 已经是还原后的 q，而 wkv_b 是用来还原 k 的。
-            # 但是 QK' = Q (latent_K*wkv_b)' = Q (wkv_b)' latent_K' = [Q (wkv_b)'] latent_K', 于是可以把 q 和 wkv_b 结合形成新的 q_new, 而 k_new := latent_k
+            # 下面构建出非 rope 分支的新的 q:
+            #     q_nope 已经是还原后的 q，而 wkv_b 是用来还原 k 的。
+            #     但是 QK' = Q (latent_K*wkv_b)' = Q (wkv_b)' latent_K' = [Q (wkv_b)'] latent_K', 于是可以把 q 和 wkv_b 结合形成新的 q_new, 而 k_new := latent_k
             q_nope = torch.einsum("bshd,hdc->bshc", q_nope, wkv_b[:, :self.qk_nope_head_dim])
             
             self.kv_cache[:bsz, start_pos:end_pos] = self.kv_norm(kv)
             self.pe_cache[:bsz, start_pos:end_pos] = k_pe.squeeze(2)
             scores = (
-                        torch.einsum("bshc,btc->bsht", q_nope, self.kv_cache[:bsz, :end_pos]) +                    # QK', 示意地说：Q=latent_q * W_q_up * W'_k_up, K=latent_k
-                        torch.einsum("bshr,btr->bsht", q_pe, self.pe_cache[:bsz, :end_pos])
+                        torch.einsum("bshc,btc->bsht", q_nope, self.kv_cache[:bsz, :end_pos]) + # QK', Q=latent_q * W_q_up * W'_k_up, K=latent_k， K=self.kv_cache[..]乃压缩后的latent
+                                                                                                # 此时 k 是单 head 的，其实就是一个 MQA 操作
+                        torch.einsum("bshr,btr->bsht", q_pe, self.pe_cache[:bsz, :end_pos])     # rope 分支：k 本来就是一个 head 的，所以 rope 分支，也是 MQA
                      ) * self.softmax_scale
         if mask is not None:
             scores += mask.unsqueeze(1)
